@@ -8,6 +8,7 @@ If none exist, built-in defaults are used.  Secrets are NEVER read from the
 config file; they come from environment variables only.
 """
 import os
+import re
 import tomllib
 
 DEFAULTS = {
@@ -21,6 +22,8 @@ DEFAULTS = {
         "steam_names_file": "",     # optional JSON {"<steamid>": "Display name"}; used only with "names"
         "cpu_cores": 0,             # host core count shown as "x/N"; 0 = hide
         "stale_after_seconds": 900, # data older than this is shown as STALE
+        "reboot_marker_time": "",   # "HH:MM" (24h, browser-local) chart marker; empty = none
+        "reboot_marker_label": "reboot",  # drawn as "<HH:MM> <label>"
     },
     "web": {
         "bind": "127.0.0.1",
@@ -69,6 +72,12 @@ def load_config(path=None, environ=None):
     g = cfg["general"]
     if g["player_display"] not in ("anonymous", "names"):
         raise ValueError('general.player_display must be "anonymous" or "names"')
+    rmt = g.get("reboot_marker_time", "")
+    if not isinstance(rmt, str) or (rmt != "" and not (
+            re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", rmt))):
+        raise ValueError('general.reboot_marker_time must be "" or a 24h "HH:MM" time (e.g. "02:30")')
+    if not isinstance(g.get("reboot_marker_label", ""), str):
+        raise ValueError("general.reboot_marker_label must be a string")
     g["data_dir"] = os.path.expanduser(str(g["data_dir"]))
     if g.get("steam_cache_file"):
         g["steam_cache_file"] = os.path.expanduser(str(g["steam_cache_file"]))

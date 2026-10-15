@@ -43,7 +43,7 @@ Config file lookup (first match wins; defaults are used if none exists):
 2. `~/.config/enshrouded-monitor/config.toml`
 3. `/etc/enshrouded-monitor/config.toml`
 
-See `config.example.toml` for every option. Never commit your real config.
+See `config.example.toml` for every option. To mark a daily restart on the chart, set `reboot_marker_time = "02:30"` (24h `HH:MM`, in the viewer's browser-local time) under `[general]`; `reboot_marker_label` (default `reboot`) is drawn as plain text after the time. The default empty time draws no marker. Never commit your real config.
 `steam_names_file` may point to a JSON file `{"<steam id>": "Name"}` kept
 outside the repo.
 

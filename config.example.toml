@@ -15,6 +15,9 @@ steam_names_file = ""                      # JSON file {"<steam id>": "Display n
                                            # only read when player_display = "names". Steam IDs are never shown.
 cpu_cores = 0                              # host CPU cores, shown as "x/N"; 0 hides the "/N"
 stale_after_seconds = 900                  # older data is shown as STALE
+reboot_marker_time = ""                    # "HH:MM" (24h, browser-local time): draw a dashed vertical line
+                                           # on the chart at that time each day; empty = no marker
+reboot_marker_label = "reboot"             # marker text, drawn as "<HH:MM> <label>" (plain text)
 
 [web]
 bind = "127.0.0.1"

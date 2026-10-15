@@ -19,6 +19,8 @@ STEAM_CACHE_FILE = _CFG["general"]["steam_cache_file"] or os.path.join(_CFG["gen
 STEAM_LOOKUP_BUDGET = 3   # max new profile fetches per run (each has a 5s timeout)
 CPU_CORES   = int(_CFG["general"]["cpu_cores"])
 STALE_AFTER_S = int(_CFG["general"]["stale_after_seconds"])
+REBOOT_MARKER_TIME  = _CFG["general"]["reboot_marker_time"]   # "" = no marker, else "HH:MM"
+REBOOT_MARKER_LABEL = str(_CFG["general"]["reboot_marker_label"])
 # ──────────────────────────────────────────────────────────────────────────────
 CSV_FILE   = os.path.join(DATA_DIR, "metrics.csv")
 HTML_FILE  = os.path.join(DATA_DIR, "index.html")
@@ -265,8 +267,16 @@ def read_csv():
                 pass
     return rows
 
+def _js_json(obj):
+    """JSON for embedding inside a <script> block: no raw <, >, & or
+    U+2028/2029, so nothing can close the script tag or break out of it."""
+    return (json.dumps(obj).replace("<", "\\u003c").replace(">", "\\u003e")
+            .replace("&", "\\u0026").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+
+
 def generate_html(rows, live, now=None):
     data_json = json.dumps(rows)
+    reboot_json = _js_json({"time": REBOOT_MARKER_TIME or "", "label": REBOOT_MARKER_LABEL})
     now        = datetime.now() if now is None else now
     updated    = now.strftime("%Y-%m-%d %H:%M:%S")
     status     = live.get("status") or ("online" if live.get("online") else "offline")
@@ -420,6 +430,7 @@ def generate_html(rows, live, now=None):
 
 <script>
 const raw=""" + data_json + """;
+const REBOOT=""" + reboot_json + """;
 
 // Status check, done client-side against the viewer's own clock: this page
 // is a static file, so if the generator stops running nothing else would
@@ -511,19 +522,23 @@ function drawChart1(data){
   ctx.font='10px system-ui';ctx.fillStyle=playerColor;ctx.textAlign='left';
   ctx.fillText('healthy idle',PAD.left+4,hy-4);ctx.restore();
 
-  // 02:30 reboot line
+  // Configurable reboot marker (browser-local time, off when REBOOT.time is empty)
+  if(REBOOT.time){
+  const rm=/^(\\d{2}):(\\d{2})$/.exec(REBOOT.time),rebootMins=+rm[1]*60+ +rm[2];
+  const rebootText=REBOOT.time+(REBOOT.label?' '+REBOOT.label:'');
   ctx.save();ctx.setLineDash([6,3]);ctx.strokeStyle=mutedColor;ctx.lineWidth=1.5;ctx.globalAlpha=0.6;
   ctx.font='10px system-ui';ctx.fillStyle=mutedColor;ctx.textAlign='center';
   for(let i=1;i<data.length;i++){
     const t=new Date(data[i].t),prev=new Date(data[i-1].t);
     const tMins=t.getHours()*60+t.getMinutes(),pMins=prev.getHours()*60+prev.getMinutes();
-    if(pMins<150&&tMins>=150){
+    if(pMins<rebootMins&&tMins>=rebootMins){
       const x=xPos(i);
       ctx.beginPath();ctx.moveTo(x,PAD.top);ctx.lineTo(x,PAD.top+H2-BAD_H);ctx.stroke();
-      ctx.globalAlpha=1;ctx.fillText('02:30 reboot',x,PAD.top+14);ctx.globalAlpha=0.6;
+      ctx.globalAlpha=1;ctx.fillText(rebootText,x,PAD.top+14);ctx.globalAlpha=0.6;
     }
   }
   ctx.restore();
+  }
 
   // CPU area + line
   ctx.beginPath();

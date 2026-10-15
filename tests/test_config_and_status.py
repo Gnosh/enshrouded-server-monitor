@@ -1,6 +1,6 @@
 """Tests for config loading and offline/stale status handling.
 No Docker, no network; only localhost HTTP on an ephemeral port."""
-import importlib.util, json, os, sys, urllib.request, tempfile, threading, time, unittest
+import unittest.mock, importlib.util, json, os, sys, urllib.request, tempfile, threading, time, unittest
 from http.client import HTTPConnection
 from http.server import HTTPServer
 
@@ -11,6 +11,10 @@ os.environ.setdefault("ENSHROUDED_SHARED_PASSWORD", "unit-test-password")
 os.environ["ENSHROUDED_MONITOR_CONFIG"] = os.path.join(_HERE, "fixtures", "test-config.toml")
 
 import enshrouded_monitor_config as cfg  # noqa: E402
+
+def _no_host_config(environ=None):
+    """Stand-in for candidate_paths so a real host config never leaks into default tests."""
+    return []
 
 
 def _load(name, filename):
@@ -29,7 +33,8 @@ class TestConfigLoading(unittest.TestCase):
         return p
 
     def test_defaults_when_no_file(self):
-        c = cfg.load_config(path=None, environ={"HOME": "/nonexistent-home"})
+        with unittest.mock.patch.object(cfg, "candidate_paths", _no_host_config):
+            c = cfg.load_config(path=None, environ={"HOME": "/nonexistent-home"})
         self.assertEqual(c["web"]["bind"], "127.0.0.1")
         self.assertEqual(c["web"]["trusted_proxy_networks"], [])
         self.assertEqual(c["admin"]["compose_file"], "")
@@ -64,6 +69,61 @@ class TestConfigLoading(unittest.TestCase):
     def test_tilde_expanded(self):
         p = self._write('[general]\ndata_dir = "~/x"\n')
         self.assertFalse(cfg.load_config(path=p)["general"]["data_dir"].startswith("~"))
+
+
+class TestRebootMarker(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mon = _load("mon_rm", "enshrouded-monitor.py")
+
+    def _cfg(self, body):
+        d = tempfile.mkdtemp(prefix="emcfg_")
+        p = os.path.join(d, "c.toml")
+        with open(p, "w") as f:
+            f.write("[general]\n" + body)
+        return p
+
+    def _html(self, t, label="reboot"):
+        self.mon.REBOOT_MARKER_TIME, self.mon.REBOOT_MARKER_LABEL = t, label
+        return self.mon.generate_html([], {"status": "online"})
+
+    def test_defaults_off(self):
+        with unittest.mock.patch.object(cfg, "candidate_paths", _no_host_config):
+            g = cfg.load_config(path=None, environ={"HOME": "/nonexistent"})["general"]
+        self.assertEqual(g["reboot_marker_time"], "")
+        self.assertEqual(g["reboot_marker_label"], "reboot")
+
+    def test_valid_and_invalid_times(self):
+        for ok in ("02:30", "00:00", "23:59", ""):
+            c = cfg.load_config(path=self._cfg(f'reboot_marker_time = "{ok}"\n'))
+            self.assertEqual(c["general"]["reboot_marker_time"], ok)
+        for bad in ("2:30", "24:00", "12:60", "0230", "02:30:00", "ab:cd", " 02:30"):
+            with self.assertRaises(ValueError, msg=bad):
+                cfg.load_config(path=self._cfg(f'reboot_marker_time = "{bad}"\n'))
+        with self.assertRaises(ValueError):
+            cfg.load_config(path=self._cfg('reboot_marker_time = 230\n'))
+
+    def test_html_off_by_default(self):
+        h = self._html("")
+        self.assertIn('const REBOOT={"time": "", "label": "reboot"};', h)
+        self.assertNotIn("02:30 reboot", h)
+
+    def test_html_on_when_configured(self):
+        h = self._html("03:15", "restart")
+        self.assertIn('const REBOOT={"time": "03:15", "label": "restart"};', h)
+        self.assertIn("ctx.fillText(rebootText", h)
+
+    def test_label_cannot_break_out(self):
+        evil = '</script><img src=x onerror=alert(1)>"\u2028&'
+        h = self._html("02:30", evil)
+        self.assertNotIn("</script><img", h)
+        self.assertNotIn("<img", h)
+        self.assertNotIn("\u2028", h)
+        self.assertIn("\\u003c/script\\u003e", h)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.mon.REBOOT_MARKER_TIME, cls.mon.REBOOT_MARKER_LABEL = "", "reboot"
 
 
 class TestStatusClassification(unittest.TestCase):
@@ -256,7 +316,8 @@ class TestMonitorCollect(unittest.TestCase):
             f.write('[general]\nplayer_display = "everyone"\n')
         with self.assertRaises(ValueError):
             cfg.load_config(path=p)
-        self.assertEqual(cfg.load_config(path=None, environ={"HOME": "/nonexistent"})["general"]["player_display"], "anonymous")
+        with unittest.mock.patch.object(cfg, "candidate_paths", _no_host_config):
+            self.assertEqual(cfg.load_config(path=None, environ={"HOME": "/nonexistent"})["general"]["player_display"], "anonymous")
 
 
 class TestLiveJsonEndpoint(unittest.TestCase):
