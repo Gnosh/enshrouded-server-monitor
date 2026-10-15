@@ -1,0 +1,2 @@
+[general]
+data_dir = "/nonexistent-test-dir"

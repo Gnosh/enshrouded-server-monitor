@@ -1,0 +1,30 @@
+# Copy to ~/.config/enshrouded-monitor/config.toml (or /etc/enshrouded-monitor/config.toml,
+# or point $ENSHROUDED_MONITOR_CONFIG at it). Do NOT commit your real copy.
+# Secrets (passwords/tokens) do NOT go here - see README.
+
+[general]
+data_dir = "/var/lib/enshrouded-monitor"   # live.json, metrics.csv, index.html are written here
+container = "enshrouded"                   # docker container name (see: docker ps)
+server_name = "My Enshrouded Server"
+player_display = "anonymous"               # "anonymous": show Player 1, Player 2, ... (safest)
+                                           # "names": show real names from steam_names_file
+steam_lookup = false                       # opt-in: look up players' PUBLIC Steam display names from
+                                           # steamcommunity.com (only with player_display = "names")
+steam_cache_file = ""                      # where looked-up names are cached; empty = <data_dir>/steam_names.json
+steam_names_file = ""                      # JSON file {"<steam id>": "Display name"}, kept outside the repo;
+                                           # only read when player_display = "names". Steam IDs are never shown.
+cpu_cores = 0                              # host CPU cores, shown as "x/N"; 0 hides the "/N"
+stale_after_seconds = 900                  # older data is shown as STALE
+
+[web]
+bind = "127.0.0.1"
+port = 8083
+cookie_name = "enshrouded_session"
+cookie_domain = ""                         # e.g. "status.example.com" when served over HTTPS
+trusted_proxy_networks = []                # e.g. ["192.0.2.0/24"] - proxies whose X-Real-IP is trusted
+
+[admin]
+compose_file = ""                          # e.g. "/srv/enshrouded/docker-compose.yml"; empty disables /admin/restart
+restart_cooldown_seconds = 300
+stop_timeout_seconds = 60
+post_start_wait_seconds = 15

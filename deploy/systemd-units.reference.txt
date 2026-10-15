@@ -1,0 +1,43 @@
+# Reference systemd units. Adjust /opt/enshrouded-monitor to wherever you copied
+# the contents of src/ (all .py files must live in the same directory).
+# Replace <placeholders>. Keep the env files mode 0600, owned by root.
+
+# /etc/systemd/system/enshrouded-monitor.service
+[Unit]
+Description=Enshrouded server metrics collector
+After=docker.service
+
+[Service]
+Type=oneshot
+Environment=ENSHROUDED_MONITOR_CONFIG=/etc/enshrouded-monitor/config.toml
+ExecStart=/usr/bin/python3 /opt/enshrouded-monitor/enshrouded-monitor.py
+
+# /etc/systemd/system/enshrouded-monitor.timer
+[Unit]
+Description=Enshrouded monitor - every 5 minutes on the clock
+
+[Timer]
+OnCalendar=*:0/5
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+
+# /etc/systemd/system/enshrouded-monitor-web.service
+# /etc/enshrouded-monitor/secrets.env contains (values are yours, never commit):
+#   ENSHROUDED_SHARED_PASSWORD=<choose a password>
+#   ENSHROUDED_ADMIN_TOKEN=<long random token; only needed if [admin] compose_file is set>
+[Unit]
+Description=Enshrouded monitor web server (authenticated)
+After=network.target
+
+[Service]
+Type=simple
+Environment=ENSHROUDED_MONITOR_CONFIG=/etc/enshrouded-monitor/config.toml
+EnvironmentFile=/etc/enshrouded-monitor/secrets.env
+ExecStart=/usr/bin/python3 /opt/enshrouded-monitor/enshrouded-monitor-web.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

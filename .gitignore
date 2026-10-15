@@ -1,0 +1,13 @@
+# real config and secrets
+config.toml
+!config.example.toml
+*.env
+.env*
+steam_names*.json
+# runtime data
+live.json
+metrics.csv
+index.html
+admin-restart.log
+__pycache__/
+*.pyc
