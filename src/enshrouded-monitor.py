@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import html, subprocess, os, sys, json, re, urllib.request, xml.etree.ElementTree as ET
+import html, math, subprocess, os, sys, json, re, urllib.request, xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -14,11 +14,12 @@ DATA_DIR    = _CFG["general"]["data_dir"]
 SERVER_NAME = html.escape(str(_CFG["general"]["server_name"]))
 STEAM_NAMES_FILE = _CFG["general"]["steam_names_file"]
 PLAYER_DISPLAY = _CFG["general"]["player_display"]   # "anonymous" | "names"
-STEAM_LOOKUP = bool(_CFG["general"]["steam_lookup"])  # opt-in network lookup of public Steam names
+STEAM_LOOKUP = _CFG["general"]["steam_lookup"]  # opt-in network lookup of public Steam names
 STEAM_CACHE_FILE = _CFG["general"]["steam_cache_file"] or os.path.join(_CFG["general"]["data_dir"], "steam_names.json")
 STEAM_LOOKUP_BUDGET = 3   # max new profile fetches per run (each has a 5s timeout)
-CPU_CORES   = int(_CFG["general"]["cpu_cores"])
-STALE_AFTER_S = int(_CFG["general"]["stale_after_seconds"])
+CPU_CORES   = _CFG["general"]["cpu_cores"]
+STALE_AFTER_S = _CFG["general"]["stale_after_seconds"]
+MAX_CSV_ROWS = _CFG["general"]["max_csv_rows"]
 REBOOT_MARKER_TIME  = _CFG["general"]["reboot_marker_time"]   # "" = no marker, else "HH:MM"
 REBOOT_MARKER_LABEL = str(_CFG["general"]["reboot_marker_label"])
 # ──────────────────────────────────────────────────────────────────────────────
@@ -63,10 +64,8 @@ def _load_steam_cache():
 
 def _save_steam_cache(cache):
     try:
-        tmp = STEAM_CACHE_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(cache, f)
-        os.replace(tmp, STEAM_CACHE_FILE)
+        # private: the cache maps Steam IDs to names (0600, atomic, no symlinks)
+        _cfgmod.atomic_write(STEAM_CACHE_FILE, json.dumps(cache), mode=0o600)
     except Exception:
         pass
 
@@ -133,13 +132,16 @@ def collect():
     cpu_pct, mem_mb = 0.0, 0
     if len(stats) >= 2:
         try:
-            cpu_pct = float(stats[0].strip("%"))
+            cpu_val = float(stats[0].strip("%"))
             mem_str = stats[1].split("/")[0].strip()
+            mem_val = 0
             if "GiB" in mem_str:
-                mem_mb = int(float(mem_str.replace("GiB","")) * 1024)
+                mem_val = int(float(mem_str.replace("GiB","")) * 1024)
             elif "MiB" in mem_str:
-                mem_mb = int(float(mem_str.replace("MiB","")))
-        except ValueError:
+                mem_val = int(float(mem_str.replace("MiB","")))
+            if math.isfinite(cpu_val) and cpu_val >= 0:
+                cpu_pct, mem_mb = cpu_val, mem_val
+        except (ValueError, OverflowError):
             pass
 
     # Main fetch: 6m window for players/bad-perf/save/water
@@ -207,10 +209,10 @@ def collect():
     entity_count, avg_tick_ms = 0, 0.0
     for line in ecss_rev:
         if 'Ent:' in line and '[ecss]' in line:
-            m = re.search(r'Ent:([0-9,]+)', line)
+            m = re.search(r'Ent:(\d+(?:,\d{3})*)(?![\d,])', line)
             if m:
                 entity_count = int(m.group(1).replace(",",""))
-            m2 = re.search(r'Avg:([\d.]+)ms', line)
+            m2 = re.search(r'Avg:(\d+(?:\.\d+)?)ms', line)
             if m2:
                 avg_tick_ms = float(m2.group(1))
             break
@@ -218,7 +220,7 @@ def collect():
     # World save size (most recent)
     save_kb = 0
     for line in rev:
-        m = re.search(r'\[savexxx\] SAVE.*size ([0-9,]+)', line)
+        m = re.search(r'\[savexxx\] SAVE.*size (\d+(?:,\d{3})*)(?![\d,])', line)
         if m:
             save_kb = int(m.group(1).replace(",","")) // 1024
             break
@@ -226,7 +228,7 @@ def collect():
     # Water save size (most recent)
     water_kb = 0
     for line in rev:
-        m = re.search(r'WaterSaveSize: ([0-9,]+)', line)
+        m = re.search(r'WaterSaveSize: (\d+(?:,\d{3})*)(?![\d,])', line)
         if m:
             water_kb = int(m.group(1).replace(",","")) // 1024
             break
@@ -235,10 +237,38 @@ def collect():
 
 def append_csv(row):
     write_header = not os.path.exists(CSV_FILE)
-    with open(CSV_FILE, "a") as f:
-        if write_header:
-            f.write(CSV_HEADER)
-        f.write(",".join(str(x) for x in row[:9]) + "\n")
+    text = (CSV_HEADER if write_header else "") + ",".join(str(x) for x in row[:9]) + "\n"
+    _cfgmod.safe_append(CSV_FILE, text, mode=0o640)
+
+def trim_csv(max_rows=None):
+    """Keep only the newest `max_rows` data rows (header preserved)."""
+    max_rows = MAX_CSV_ROWS if max_rows is None else max_rows
+    try:
+        with open(CSV_FILE) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return
+    if len(lines) - 1 <= max_rows:
+        return
+    keep = [CSV_HEADER.rstrip("\n")] + lines[-max_rows:]
+    _cfgmod.atomic_write(CSV_FILE, "\n".join(keep) + "\n", mode=0o640)
+
+_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+
+def _valid_ts(t):
+    if not _TS_RE.fullmatch(t):
+        return False
+    try:
+        datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
+
+def _finite(x):
+    x = float(x)
+    if not math.isfinite(x):
+        raise ValueError("non-finite number")
+    return x
 
 def read_csv():
     if not os.path.exists(CSV_FILE):
@@ -251,19 +281,21 @@ def read_csv():
             p = line.strip().split(",")
             if len(p) < 5:
                 continue
+            if not _valid_ts(p[0]):
+                continue
             try:
                 rows.append({
                     "t":        p[0],
-                    "cpu":      float(p[1]),
-                    "mem":      int(float(p[2])),
+                    "cpu":      _finite(p[1]),
+                    "mem":      int(_finite(p[2])),
                     "players":  int(p[3]),
                     "bad_perf": int(p[4]),
                     "entities": int(p[5]) if len(p) > 5 else 0,
-                    "tick":     float(p[6]) if len(p) > 6 else 0,
+                    "tick":     _finite(p[6]) if len(p) > 6 else 0,
                     "save_kb":  int(p[7]) if len(p) > 7 else 0,
                     "water_kb": int(p[8]) if len(p) > 8 else 0,
                 })
-            except ValueError:
+            except (ValueError, OverflowError):
                 pass
     return rows
 
@@ -275,11 +307,13 @@ def _js_json(obj):
 
 
 def generate_html(rows, live, now=None):
-    data_json = json.dumps(rows)
+    data_json = _js_json(rows)   # never raw json.dumps inside <script>
     reboot_json = _js_json({"time": REBOOT_MARKER_TIME or "", "label": REBOOT_MARKER_LABEL})
     now        = datetime.now() if now is None else now
     updated    = now.strftime("%Y-%m-%d %H:%M:%S")
     status     = live.get("status") or ("online" if live.get("online") else "offline")
+    if status not in ("online", "offline", "unknown", "stale"):
+        status = "unknown"   # status is embedded in markup and script
     # Embed an epoch-ms timestamp alongside the display string so the page
     # itself (client-side, against the viewer's own clock) can tell whether
     # it's looking at a fresh read or a frozen one — the generator process
@@ -481,9 +515,15 @@ function drawChart1(data){
   const mutedColor=cs.getPropertyValue('--muted').trim();
   const borderColor=cs.getPropertyValue('--border').trim();
   const BAD_H=36;
-  const maxCores=Math.ceil(Math.max(...data.map(d=>d.cpu/100))/2)*2||2;
-  const maxPlayers=Math.max(1,...data.map(d=>d.players));
-  const maxBadPerf=Math.max(1,...data.map(d=>d.bad_perf));
+  if(data.length<2){
+    ctx.fillStyle=mutedColor;ctx.font='12px system-ui';ctx.textAlign='center';
+    ctx.fillText('Collecting data...',W/2,H/2);
+    return;
+  }
+  const maxOf=(a,m)=>a.reduce((x,v)=>v>x?v:x,m);
+  const maxCores=Math.ceil(maxOf(data.map(d=>d.cpu/100),0)/2)*2||2;
+  const maxPlayers=maxOf(data.map(d=>d.players),1);
+  const maxBadPerf=maxOf(data.map(d=>d.bad_perf),1);
   const xPos=i=>PAD.left+(i/(data.length-1))*W2;
   const yC=v=>PAD.top+(H2-BAD_H)-(v/100/maxCores)*(H2-BAD_H);
   const yP=v=>PAD.top+(H2-BAD_H)-(v/maxPlayers)*(H2-BAD_H);
@@ -530,8 +570,13 @@ function drawChart1(data){
   ctx.font='10px system-ui';ctx.fillStyle=mutedColor;ctx.textAlign='center';
   for(let i=1;i<data.length;i++){
     const t=new Date(data[i].t),prev=new Date(data[i-1].t);
-    const tMins=t.getHours()*60+t.getMinutes(),pMins=prev.getHours()*60+prev.getMinutes();
-    if(pMins<rebootMins&&tMins>=rebootMins){
+    // full date/time comparison so a marker at 00:00 (or across a gap) works
+    let crossed=false;
+    for(const base of [prev,t]){
+      const R=new Date(base.getFullYear(),base.getMonth(),base.getDate(),Math.floor(rebootMins/60),rebootMins%60);
+      if(prev<R&&R<=t)crossed=true;
+    }
+    if(crossed){
       const x=xPos(i);
       ctx.beginPath();ctx.moveTo(x,PAD.top);ctx.lineTo(x,PAD.top+H2-BAD_H);ctx.stroke();
       ctx.globalAlpha=1;ctx.fillText(rebootText,x,PAD.top+14);ctx.globalAlpha=0.6;
@@ -607,9 +652,10 @@ function drawChart2(data){
     return;
   }
 
-  const maxSave=Math.max(...valid.map(d=>d.save_kb),1);
-  const maxEntK=Math.max(...valid.map(d=>d.entities/1000),1);
-  const maxTick=Math.max(...valid.map(d=>d.tick),1);
+  const maxOf=(a,m)=>a.reduce((x,v)=>v>x?v:x,m);
+  const maxSave=maxOf(valid.map(d=>d.save_kb),1);
+  const maxEntK=maxOf(valid.map(d=>d.entities/1000),1);
+  const maxTick=maxOf(valid.map(d=>d.tick),1);
   const xPos=i=>PAD.left+(i/(valid.length-1))*W2;
   const yS=v=>PAD.top+H2-(v/maxSave)*H2;
   const yE=v=>PAD.top+H2-(v/maxEntK)*H2;   // v in K
@@ -724,14 +770,15 @@ def last_known(field_idx, cast=int):
             if len(p) > field_idx:
                 try:
                     v = cast(p[field_idx])
-                    if v > 0:
+                    if math.isfinite(v) and v > 0:
                         result = v
-                except ValueError:
+                except (ValueError, OverflowError):
                     pass
     return result
 
 def main():
-    os.makedirs(DATA_DIR, exist_ok=True)
+    os.umask(0o027)   # data files are group-readable at most, never world-readable
+    os.makedirs(DATA_DIR, mode=0o750, exist_ok=True)
     row = collect()
     row = list(row)
     # Game stops logging save/water events when no players are online.
@@ -748,6 +795,7 @@ def main():
     if row[8] == 0:
         row[8] = last_known(8)  # water_kb
     append_csv(row)
+    trim_csv()
     status = row[10]
     now = datetime.now(timezone.utc)
     live = {
@@ -759,13 +807,10 @@ def main():
         "entity_count": row[5], "avg_tick_ms": row[6],
         "save_size_kb": row[7], "water_size_kb": row[8], "pings": row[9]
     }
-    tmp = LIVE_FILE + ".tmp"
-    with open(tmp, "w") as f:   # atomic replace: readers never see a partial file
-        json.dump(live, f)
-    os.replace(tmp, LIVE_FILE)
+    # atomic replace: readers never see a partial file; refuses symlinks
+    _cfgmod.atomic_write(LIVE_FILE, json.dumps(live), mode=0o640)
     rows = read_csv()
-    with open(HTML_FILE, "w") as f:
-        f.write(generate_html(rows, live))
+    _cfgmod.atomic_write(HTML_FILE, generate_html(rows, live), mode=0o640)
     print(f"[{row[0]}] status={status} cpu={row[1]}% players={row[3]} ent={row[5]} tick={row[6]}ms save={row[7]}KB water={row[8]}KB bad={row[4]}")
 
 if __name__ == "__main__":

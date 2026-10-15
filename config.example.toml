@@ -18,16 +18,30 @@ stale_after_seconds = 900                  # older data is shown as STALE
 reboot_marker_time = ""                    # "HH:MM" (24h, browser-local time): draw a dashed vertical line
                                            # on the chart at that time each day; empty = no marker
 reboot_marker_label = "reboot"             # marker text, drawn as "<HH:MM> <label>" (plain text)
+max_csv_rows = 50000                       # metrics.csv keeps only the newest N rows (1000..1000000);
+                                           # 5-minute samples: 50000 rows is about 173 days
+
+# Unknown keys, wrong types and out-of-range values are rejected at startup.
 
 [web]
-bind = "127.0.0.1"
+bind = "127.0.0.1"                         # keep on loopback; put a TLS reverse proxy in front
 port = 8083
 cookie_name = "enshrouded_session"
-cookie_domain = ""                         # e.g. "status.example.com" when served over HTTPS
-trusted_proxy_networks = []                # e.g. ["192.0.2.0/24"] - proxies whose X-Real-IP is trusted
+cookie_domain = ""                         # empty = host-only cookie (recommended). Set only to share the
+                                           # cookie with sibling subdomains, e.g. "status.example.com"
+cookie_secure = true                       # Secure flag on the session cookie. Set false ONLY for plain-HTTP
+                                           # dev/LAN use (a startup warning is printed)
+cookie_max_age_seconds = 2592000           # session lifetime, 30 days (60..31536000)
+trusted_proxy_networks = []                # e.g. ["192.0.2.0/24"] - proxies whose X-Real-IP is trusted;
+                                           # the proxy MUST overwrite X-Real-IP
+max_connections = 32                       # max simultaneous handler threads; extra connections get 503
+request_timeout_seconds = 10               # socket read timeout and total time allowed to send a request
+login_global_limit_per_minute = 60         # login attempts/min across ALL clients (global brute-force cap)
 
 [admin]
 compose_file = ""                          # e.g. "/srv/enshrouded/docker-compose.yml"; empty disables /admin/restart
-restart_cooldown_seconds = 300
-stop_timeout_seconds = 60
-post_start_wait_seconds = 15
+compose_service = ""                       # REQUIRED when compose_file is set, e.g. "enshrouded":
+                                           # only this service is stopped/started
+restart_cooldown_seconds = 300             # minimum time between restarts (0..86400), measured from the end
+stop_timeout_seconds = 60                  # graceful stop timeout (1..600)
+post_start_wait_seconds = 15               # wait before checking the container is running/healthy (0..300)

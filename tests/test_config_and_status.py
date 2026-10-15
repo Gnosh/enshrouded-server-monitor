@@ -329,7 +329,7 @@ class TestLiveJsonEndpoint(unittest.TestCase):
         cls.srv = HTTPServer(("127.0.0.1", 0), cls.web._Handler)
         cls.port = cls.srv.server_address[1]
         threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
-        cls.cookie = f"{cls.web.COOKIE_NAME}={cls.web.make_cookie_value(os.environ['ENSHROUDED_SHARED_PASSWORD'])}"
+        cls.cookie = f"{cls.web.COOKIE_NAME}={cls.web.make_cookie_value(cls.web._cookie_secret())}"
 
     @classmethod
     def tearDownClass(cls):

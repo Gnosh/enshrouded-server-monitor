@@ -1,34 +1,49 @@
 #!/usr/bin/env python3
 """
-Enshrouded Monitor — authenticated HTTP server.
+Enshrouded Monitor - authenticated HTTP server.
 Replaces `python3 -m http.server` for the monitor web service.
 
-Env vars: ENSHROUDED_SHARED_PASSWORD (required), ENSHROUDED_ADMIN_TOKEN
-(required only when [admin] compose_file is set). All other settings come
-from the config file (see config.example.toml).
+Env vars:
+  ENSHROUDED_SHARED_PASSWORD  (required) status page password
+  ENSHROUDED_ADMIN_TOKEN      (required only when [admin] compose_file is set;
+                               must differ from the password)
+  ENSHROUDED_COOKIE_SECRET    (optional, >= 32 chars) HMAC key for session cookies.
+                               If unset a random key is generated at every start, so
+                               all sessions end when the service restarts. Set it
+                               to keep sessions across restarts (or to share the
+                               cookie with another service that knows the same
+                               secret). It is deliberately NOT derived from the
+                               password, so a stolen cookie gives no offline
+                               password-guessing oracle.
+All other settings come from the config file (see config.example.toml).
 
-Cookie contract (may be shared with other services that verify the same cookie):
-  Name:    enshrouded_session
-  Value:   <expiry_unix_seconds>.<base64url_no_pad(HMAC-SHA256(password, expiry_str))>
-  Domain:  [web] cookie_domain from config (HTTPS path only; empty = host-only)
+Cookie contract:
+  Name:    [web] cookie_name (default enshrouded_session)
+  Value:   <expiry_unix_seconds>.<base64url_no_pad(HMAC-SHA256(secret,
+           "enshrouded-session-v1:" + expiry_str))>
+  Domain:  only if [web] cookie_domain is set (otherwise host-only)
   Path:    /
-  Flags:   HttpOnly; Secure; SameSite=Lax; Max-Age=31536000
-  Direct HTTP access: same cookie value, same name, no Domain, no Secure flag.
+  Flags:   HttpOnly; SameSite=Lax; Max-Age=<cookie_max_age_seconds>;
+           Secure unless [web] cookie_secure = false (plain-HTTP dev only)
+  Logout only clears the browser cookie; a copied cookie stays valid until it
+  expires or the signing secret changes (restart without COOKIE_SECRET).
 
 Admin restart contract:
   POST /admin/restart, header: Authorization: Bearer <ENSHROUDED_ADMIN_TOKEN>
-  Deliberately a separate secret from ENSHROUDED_SHARED_PASSWORD — leaking
+  Deliberately a separate secret from ENSHROUDED_SHARED_PASSWORD - leaking
   the read-only status password must not grant restart capability.
-  Synchronous: the container's own entrypoint already checks Steam for an
-  update and applies it on every start, so a restart *is* the update-apply
-  step — nothing extra needed there. Response can take up to ~90s (graceful
-  stop timeout + startup + a short post-start log check); size any caller
-  timeout accordingly.
+  Only [admin] compose_service is stopped and started again. Synchronous:
+  the container's own entrypoint checks Steam for an update on every start,
+  so a restart is the update-apply step. After starting, the container is
+  inspected; the call only reports ok if it is running and not unhealthy.
+  `updateApplied` is true only when the log shows an update being installed,
+  otherwise null ("unknown") - a quiet log is not proof that no update ran.
+  Response can take ~90s; size any caller timeout accordingly.
 """
-import base64, hashlib, hmac, ipaddress, json, os, subprocess, sys, threading, time
+import base64, collections, hashlib, hmac, ipaddress, json, os, secrets, subprocess, sys, threading, time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 # ── Config ────────────────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
@@ -36,22 +51,27 @@ import enshrouded_monitor_config as _cfgmod  # noqa: E402
 
 _CFG = _cfgmod.load_config()
 BIND           = _CFG["web"]["bind"]
-PORT           = int(_CFG["web"]["port"])
+PORT           = _CFG["web"]["port"]
 DATA_DIR       = _CFG["general"]["data_dir"]
 COOKIE_NAME    = _CFG["web"]["cookie_name"]
 COOKIE_DOMAIN  = _CFG["web"]["cookie_domain"]
-COOKIE_MAX_AGE = 31_536_000   # 1 year in seconds
+COOKIE_SECURE  = _CFG["web"]["cookie_secure"]
+COOKIE_MAX_AGE = _CFG["web"]["cookie_max_age_seconds"]
+MAX_CONNECTIONS = _CFG["web"]["max_connections"]
+REQUEST_TIMEOUT_S = float(_CFG["web"]["request_timeout_seconds"])
+GLOBAL_LOGIN_PER_MIN = _CFG["web"]["login_global_limit_per_minute"]
 LOCKOUT_SECS   = 30
 LOCKOUT_CAP    = 2_048        # max in-memory lockout entries
 STALE_AFTER_S  = float(_CFG["general"]["stale_after_seconds"])
 
 # Admin restart (disabled unless compose_file is configured)
 COMPOSE_FILE        = _CFG["admin"]["compose_file"]
+COMPOSE_SERVICE     = _CFG["admin"]["compose_service"]
 GAME_CONTAINER      = _CFG["general"]["container"]
 RESTART_LOG         = os.path.join(DATA_DIR, "admin-restart.log")
-RESTART_COOLDOWN_S  = int(_CFG["admin"]["restart_cooldown_seconds"])
-STOP_TIMEOUT_S      = int(_CFG["admin"]["stop_timeout_seconds"])
-POST_START_WAIT_S   = int(_CFG["admin"]["post_start_wait_seconds"])
+RESTART_COOLDOWN_S  = _CFG["admin"]["restart_cooldown_seconds"]
+STOP_TIMEOUT_S      = _CFG["admin"]["stop_timeout_seconds"]
+POST_START_WAIT_S   = _CFG["admin"]["post_start_wait_seconds"]
 
 # X-Real-IP is trusted only from peers in these networks (your reverse
 # proxy); all other callers use their direct socket address.
@@ -75,20 +95,57 @@ def _admin_token() -> str:
     return v
 
 
+_SECRET_CACHE: list = []
+
+
+def _cookie_secret() -> bytes:
+    """Cookie signing key: ENSHROUDED_COOKIE_SECRET, else random per process.
+    Independent of the password by design."""
+    if not _SECRET_CACHE:
+        env = os.environ.get("ENSHROUDED_COOKIE_SECRET", "")
+        if env:
+            if len(env) < 32:
+                sys.exit("FATAL: ENSHROUDED_COOKIE_SECRET must be at least 32 characters")
+            _SECRET_CACHE.append(env.encode())
+        else:
+            _SECRET_CACHE.append(secrets.token_bytes(32))
+    return _SECRET_CACHE[0]
+
+
+def startup_checks(password: str, admin_token) -> list:
+    """Fatal config problems exit; returns a list of warning strings."""
+    warnings = []
+    if admin_token is not None and hmac.compare_digest(password.encode(), admin_token.encode()):
+        sys.exit("FATAL: ENSHROUDED_ADMIN_TOKEN must differ from ENSHROUDED_SHARED_PASSWORD")
+    cs = os.environ.get("ENSHROUDED_COOKIE_SECRET", "")
+    if cs and (hmac.compare_digest(cs.encode(), password.encode())
+               or (admin_token and hmac.compare_digest(cs.encode(), admin_token.encode()))):
+        sys.exit("FATAL: ENSHROUDED_COOKIE_SECRET must differ from the password and admin token")
+    if not COOKIE_SECURE:
+        warnings.append("cookie_secure = false: session cookies are sent without the "
+                        "Secure flag. Use only for plain-HTTP development/LAN.")
+    if not cs:
+        warnings.append("ENSHROUDED_COOKIE_SECRET not set: using a random per-process "
+                        "signing key; all sessions end when this service restarts.")
+    return warnings
+
+
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
-def _sign(password: str, expiry_str: str) -> str:
-    return _b64url(hmac.new(password.encode(), expiry_str.encode(), hashlib.sha256).digest())
+def _sign(secret, expiry_str: str) -> str:
+    key = secret if isinstance(secret, bytes) else secret.encode()
+    msg = b"enshrouded-session-v1:" + expiry_str.encode()   # domain separation
+    return _b64url(hmac.new(key, msg, hashlib.sha256).digest())
 
 
-def make_cookie_value(password: str, now: int = None) -> str:
+def make_cookie_value(secret, now: int = None) -> str:
     expiry = str((now if now is not None else int(time.time())) + COOKIE_MAX_AGE)
-    return f"{expiry}.{_sign(password, expiry)}"
+    return f"{expiry}.{_sign(secret, expiry)}"
 
 
-def verify_cookie_value(value: str, password: str, now: int = None) -> bool:
+def verify_cookie_value(value: str, secret, now: int = None) -> bool:
     """True iff value is a valid, non-expired, correctly-signed cookie token."""
     try:
         dot        = value.index(".")
@@ -100,15 +157,24 @@ def verify_cookie_value(value: str, password: str, now: int = None) -> bool:
             return False
         if expiry > t + COOKIE_MAX_AGE + 60:   # implausibly far future
             return False
-        return hmac.compare_digest(sig, _sign(password, expiry_str))
+        return hmac.compare_digest(sig, _sign(secret, expiry_str))
     except Exception:
         return False
 
 
-# ── Lockout ───────────────────────────────────────────────────────────────────
+# ── Lockout / attempt limiting ────────────────────────────────────────────────
 
-_lockouts: dict = {}   # ip -> unlock_at float
+_lockouts: dict = {}   # canonical-ip (or "admin:<ip>") -> unlock_at float
+_global_hits = {"login": collections.deque(), "admin": collections.deque()}
 _lock = threading.Lock()
+
+
+def canonical_ip(addr: str) -> str:
+    """Canonical text form so equivalent spellings share one lockout key."""
+    ip = ipaddress.ip_address(addr)
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return str(ip)
 
 
 def lockout_remaining(ip: str) -> float:
@@ -117,11 +183,47 @@ def lockout_remaining(ip: str) -> float:
         return max(0.0, _lockouts.get(ip, 0.0) - time.time())
 
 
+def _set_locked(key: str) -> None:
+    """Caller holds _lock. Bounded: when full, the entry that unlocks soonest
+    (the oldest) is evicted, so a new offender is ALWAYS recorded."""
+    if key not in _lockouts and len(_lockouts) >= LOCKOUT_CAP:
+        del _lockouts[min(_lockouts, key=_lockouts.get)]
+    _lockouts[key] = time.time() + LOCKOUT_SECS
+
+
 def set_lockout(ip: str) -> None:
     with _lock:
         _prune()
-        if len(_lockouts) < LOCKOUT_CAP:
-            _lockouts[ip] = time.time() + LOCKOUT_SECS
+        _set_locked(ip)
+
+
+def reserve_attempt(key: str, bucket: str = "login") -> float:
+    """Atomically check the per-client lockout AND the global rate, and if both
+    allow it, reserve the attempt (the client is locked for LOCKOUT_SECS until
+    release_attempt() is called after a successful auth). Returns 0.0 when
+    reserved, else the seconds the caller must wait. Because the reservation
+    happens before the body is read and the password compared, concurrent
+    guesses from one client cannot slip through together."""
+    with _lock:
+        _prune()
+        now = time.time()
+        rem = _lockouts.get(key, 0.0) - now
+        if rem > 0:
+            return rem
+        hits = _global_hits[bucket]
+        while hits and hits[0] <= now - 60:
+            hits.popleft()
+        if len(hits) >= GLOBAL_LOGIN_PER_MIN:
+            return max(1.0, hits[0] + 60 - now)
+        hits.append(now)
+        _set_locked(key)
+        return 0.0
+
+
+def release_attempt(key: str) -> None:
+    """Clear the reservation after successful authentication."""
+    with _lock:
+        _lockouts.pop(key, None)
 
 
 def _prune() -> None:
@@ -134,7 +236,7 @@ def _prune() -> None:
 
 # ── Admin restart ─────────────────────────────────────────────────────────────
 
-_admin_state = {"last_restart_at": 0.0}
+_admin_state = {"last_restart_at": 0.0, "in_progress": False}
 
 
 def _restart_cooldown_remaining() -> float:
@@ -142,15 +244,23 @@ def _restart_cooldown_remaining() -> float:
         return max(0.0, RESTART_COOLDOWN_S - (time.time() - _admin_state["last_restart_at"]))
 
 
-def _claim_restart_slot() -> bool:
-    """Atomically check-and-set the cooldown. False if one's already active —
-    this doubles as the mutex against a second trigger firing mid-restart,
-    since the clock starts before the (slow) restart work even begins."""
+def _claim_restart_slot():
+    """Returns (True, None) when claimed, else (False, "in_progress"|"cooldown").
+    A dedicated in-progress flag is the mutex; the cooldown (measured from the
+    END of the previous restart) is separate and may be configured to 0."""
     with _lock:
+        if _admin_state["in_progress"]:
+            return False, "in_progress"
         if time.time() - _admin_state["last_restart_at"] < RESTART_COOLDOWN_S:
-            return False
+            return False, "cooldown"
+        _admin_state["in_progress"] = True
+        return True, None
+
+
+def _release_restart_slot() -> None:
+    with _lock:
+        _admin_state["in_progress"] = False
         _admin_state["last_restart_at"] = time.time()
-        return True
 
 
 def _log_restart(ts: str, *, ok: bool, update_applied=None, note: str = None) -> None:
@@ -158,25 +268,37 @@ def _log_restart(ts: str, *, ok: bool, update_applied=None, note: str = None) ->
     if update_applied is not None:
         parts.append(f"update_applied={update_applied}")
     if note:
-        parts.append(note)
+        parts.append(note.replace("\n", " "))
     line = " ".join(parts)
     try:
-        with open(RESTART_LOG, "a") as f:
-            f.write(line + "\n")
+        _cfgmod.safe_append(RESTART_LOG, line + "\n", mode=0o640)
     except OSError:
         pass
     print(f"[admin-restart] {line}", flush=True)
 
 
+def _container_state() -> tuple:
+    """(running: bool|None, health: str) from docker inspect; None = no answer."""
+    r = subprocess.run(
+        ["docker", "inspect", "-f",
+         "{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{end}}",
+         GAME_CONTAINER],
+        capture_output=True, text=True, timeout=15)
+    out = r.stdout.strip().split()
+    if r.returncode != 0 or not out or out[0] not in ("true", "false"):
+        return None, ""
+    return out[0] == "true", (out[1] if len(out) > 1 else "")
+
+
 def _do_restart() -> dict:
-    """Graceful stop (respecting the game's save-on-exit) then start back up.
-    The container's own entrypoint checks Steam for an update and applies it
-    on every start — that's *why* a plain restart satisfies "check for update,
-    apply if found" with no separate step needed here."""
+    """Graceful stop (respecting the game's save-on-exit) then start back up -
+    only the configured compose service. The container's own entrypoint checks
+    Steam for an update and applies it on every start."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    base = ["docker", "compose", "-f", COMPOSE_FILE]
     try:
         stop = subprocess.run(
-            ["docker", "compose", "-f", COMPOSE_FILE, "stop", "-t", str(STOP_TIMEOUT_S)],
+            base + ["stop", "-t", str(STOP_TIMEOUT_S), COMPOSE_SERVICE],
             capture_output=True, text=True, timeout=STOP_TIMEOUT_S + 30,
         )
         if stop.returncode != 0:
@@ -184,31 +306,39 @@ def _do_restart() -> dict:
             return {"ok": False, "reason": "stop_failed", "message": stop.stderr.strip()[:500]}
 
         up = subprocess.run(
-            ["docker", "compose", "-f", COMPOSE_FILE, "up", "-d"],
-            capture_output=True, text=True, timeout=60,
+            base + ["up", "-d", "--no-deps", COMPOSE_SERVICE],
+            capture_output=True, text=True, timeout=120,
         )
         if up.returncode != 0:
-            _log_restart(ts, ok=False, note=f"start failed: {up.stderr.strip()[:200]}")
-            return {"ok": False, "reason": "start_failed", "message": up.stderr.strip()[:500]}
+            _log_restart(ts, ok=False, note=f"start failed after stop: {up.stderr.strip()[:200]}")
+            return {"ok": False, "reason": "start_failed", "stopped": True,
+                    "message": up.stderr.strip()[:500]}
 
-        # Let the entrypoint reach its update-check phase, then look at what
-        # it actually did. "Downloading update"/"Installing update" is the
-        # concrete signal an update was applied; there's no equally concrete
-        # signal for "checked, none was available" vs. "checked, found one" —
-        # so updateFound mirrors updateApplied rather than guessing.
         time.sleep(POST_START_WAIT_S)
+        running, health = _container_state()
+        if running is not True or health == "unhealthy":
+            why = "not_running" if running is not True else "unhealthy"
+            _log_restart(ts, ok=False, note=f"after start: {why} (running={running} health={health or '-'})")
+            return {"ok": False, "reason": why, "running": running, "health": health or None,
+                    "message": "Compose started the service but the container is not healthy."}
+
         logs = subprocess.run(
             ["docker", "logs", "--since", f"{POST_START_WAIT_S + 15}s", GAME_CONTAINER],
             capture_output=True, text=True, timeout=15,
-        ).stdout
-        update_applied = ("Downloading update" in logs) or ("Installing update" in logs)
+        )
+        # Only a positive log line is evidence. Its absence is NOT evidence that
+        # no update was pending (log may be incomplete / not yet reached).
+        text = logs.stdout + logs.stderr
+        applied = True if (logs.returncode == 0 and (
+            "Downloading update" in text or "Installing update" in text)) else None
 
-        _log_restart(ts, ok=True, update_applied=update_applied)
+        _log_restart(ts, ok=True, update_applied=("yes" if applied else "unknown"))
         return {
-            "ok": True, "updateFound": update_applied, "updateApplied": update_applied,
-            "restarted": True,
-            "message": ("Update applied, server restarted cleanly." if update_applied
-                        else "Server restarted cleanly, no update was pending."),
+            "ok": True, "restarted": True, "running": True, "health": health or None,
+            "updateStatus": "applied" if applied else "unknown",
+            "updateFound": applied, "updateApplied": applied,
+            "message": ("Update applied, server restarted." if applied
+                        else "Server restarted and is running; update status unknown."),
         }
     except subprocess.TimeoutExpired as e:
         _log_restart(ts, ok=False, note=f"timeout: {e}")
@@ -302,9 +432,38 @@ def _login_html(*, lockout: float = 0.0, wrong: bool = False) -> bytes:
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
+class _DeadlineReader:
+    """Wraps rfile: the whole request (headers + body) must arrive before a
+    fixed deadline, so a client dribbling one byte per socket timeout (slowloris)
+    cannot hold a thread. The socket timeout bounds each individual read."""
+
+    def __init__(self, raw, deadline: float):
+        self._raw, self._deadline = raw, deadline
+
+    def _check(self):
+        if time.monotonic() > self._deadline:
+            raise TimeoutError("request deadline exceeded")
+
+    def readline(self, *a):
+        self._check()
+        return self._raw.readline(*a)
+
+    def read(self, *a):
+        self._check()
+        return self._raw.read(*a)
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "EnshroudedMonitor/1"
     sys_version    = ""
+    timeout        = REQUEST_TIMEOUT_S      # per-recv socket timeout (StreamRequestHandler)
+
+    def setup(self):
+        super().setup()
+        self.rfile = _DeadlineReader(self.rfile, time.monotonic() + REQUEST_TIMEOUT_S)
 
     def log_message(self, fmt, *args):
         pass   # never log paths — could contain form data in edge cases
@@ -316,29 +475,33 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _ip(self) -> str:
         """
-        Return the client IP to use for lockout keying.
+        Return the canonical client IP to use for lockout keying.
 
         Trust X-Real-IP only when the direct TCP peer is in one of the
         configured trusted_proxy_networks. All other callers use their
         socket address as-is.
         """
-        peer = self.client_address[0]
+        peer = canonical_ip(self.client_address[0])
         try:
             if any(ipaddress.ip_address(peer) in n for n in _TRUSTED_PROXY_NETS):
                 real_ip = self.headers.get("X-Real-IP", "").strip()
                 if real_ip:
-                    ipaddress.ip_address(real_ip)   # validate format
-                    return real_ip
+                    return canonical_ip(real_ip)   # validates + canonicalises
         except ValueError:
             pass
         return peer
 
-    def _is_production(self) -> bool:
-        """True when a cookie_domain is configured and the request Host matches it."""
-        if not COOKIE_DOMAIN:
-            return False
-        host = self.headers.get("Host", "").split(":")[0]
-        return host == COOKIE_DOMAIN or host.endswith("." + COOKIE_DOMAIN)
+    def _same_origin(self) -> bool:
+        """CSRF guard for browser-driven state changes. Sec-Fetch-Site (set by
+        the browser, unforgeable by pages) decides when present; else an Origin
+        header must match Host; non-browser clients send neither and pass."""
+        sfs = self.headers.get("Sec-Fetch-Site")
+        if sfs is not None:
+            return sfs == "same-origin"
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            return urlsplit(origin).netloc == self.headers.get("Host", "")
+        return True
 
     def _cookie_value(self):
         for part in self.headers.get("Cookie", "").split(";"):
@@ -349,15 +512,16 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _authed(self) -> bool:
         c = self._cookie_value()
-        return c is not None and verify_cookie_value(c, _pw())
+        return c is not None and verify_cookie_value(c, _cookie_secret())
 
     def _send(self, code: int, ct: str, body: bytes,
-              extra=(), no_store: bool = False) -> None:
+              extra=(), no_store: bool = True) -> None:
+        # no_store is kept for compatibility; every response is no-store
+        # (authenticated content must never be cached by browsers or proxies).
         self.send_response(code)
         self.send_header("Content-Type", ct)
         self.send_header("Content-Length", str(len(body)))
-        if no_store:
-            self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "no-store")
         for k, v in _SEC:
             self.send_header(k, v)
         for k, v in extra:
@@ -379,20 +543,20 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
 
+    def _cookie_attrs(self) -> str:
+        attrs = "Path=/; "
+        if COOKIE_DOMAIN:
+            attrs = f"Domain={COOKIE_DOMAIN}; " + attrs
+        return attrs
+
     def _cookie_header(self) -> str:
-        val = make_cookie_value(_pw())
-        if self._is_production():
-            return (f"{COOKIE_NAME}={val}; Domain={COOKIE_DOMAIN}; Path=/; "
-                    f"Max-Age={COOKIE_MAX_AGE}; HttpOnly; Secure; SameSite=Lax")
-        # LAN/HTTP: same token, no Domain restriction, no Secure flag
-        return (f"{COOKIE_NAME}={val}; Path=/; "
-                f"Max-Age={COOKIE_MAX_AGE}; HttpOnly; SameSite=Lax")
+        val = make_cookie_value(_cookie_secret())
+        return (f"{COOKIE_NAME}={val}; {self._cookie_attrs()}Max-Age={COOKIE_MAX_AGE}; "
+                f"HttpOnly; SameSite=Lax" + ("; Secure" if COOKIE_SECURE else ""))
 
     def _clear_cookie_header(self) -> str:
-        if self._is_production():
-            return (f"{COOKIE_NAME}=deleted; Domain={COOKIE_DOMAIN}; Path=/; "
-                    f"Max-Age=0; HttpOnly; Secure; SameSite=Lax")
-        return f"{COOKIE_NAME}=deleted; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+        return (f"{COOKIE_NAME}=deleted; {self._cookie_attrs()}Max-Age=0; "
+                f"HttpOnly; SameSite=Lax" + ("; Secure" if COOKIE_SECURE else ""))
 
     def _show_login(self, *, lockout: float = 0.0, wrong: bool = False) -> None:
         body = _login_html(lockout=lockout, wrong=wrong)
@@ -409,7 +573,7 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/_auth/logout":
-            self._logout(); return
+            self._send(405, "text/plain", b"Use POST", extra=[("Allow", "POST")]); return
         if not self._authed():
             self._show_login(lockout=lockout_remaining(self._ip())); return
         if path in ("/", "/index.html"):
@@ -433,26 +597,32 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(404, "text/plain", b"Not found")
 
     def _login(self) -> None:
+        if not self._same_origin():
+            self._send(403, "text/plain", b"Forbidden"); return
         ip  = self._ip()
-        rem = lockout_remaining(ip)
+        # Reserve the attempt BEFORE reading the body or comparing passwords.
+        rem = reserve_attempt(ip, "login")
         if rem > 0:
             self._send_429(rem); return
 
         try:
             length = max(0, int(self.headers.get("Content-Length", 0)))
-        except ValueError:
-            length = 0
-        raw     = self.rfile.read(min(length, 4096)).decode(errors="replace")
+            raw = self.rfile.read(min(length, 4096)).decode(errors="replace")
+        except (ValueError, OSError):    # bad length, timeout, reset: attempt stays counted
+            self.close_connection = True
+            return
         attempt = parse_qs(raw).get("password", [""])[0]
         # attempt is never logged, stored, or passed outside this scope
 
         if hmac.compare_digest(attempt.encode(), _pw().encode()):
+            release_attempt(ip)
             self._redirect("/", extra=[("Set-Cookie", self._cookie_header())])
         else:
-            set_lockout(ip)
-            self._send_429(lockout_remaining(ip))
+            self._send_429(lockout_remaining(ip) or LOCKOUT_SECS)
 
     def _logout(self) -> None:
+        if not self._same_origin():
+            self._send(403, "text/plain", b"Forbidden"); return
         self._redirect("/", extra=[("Set-Cookie", self._clear_cookie_header())])
 
     def _admin_restart(self) -> None:
@@ -462,7 +632,7 @@ class _Handler(BaseHTTPRequestHandler):
         ip        = self._ip()
         admin_key = "admin:" + ip
 
-        rem = lockout_remaining(admin_key)
+        rem = reserve_attempt(admin_key, "admin")
         if rem > 0:
             self._send_json(429, {"ok": False, "reason": "auth_lockout",
                                    "retryAfterSeconds": int(rem) + 1},
@@ -472,18 +642,21 @@ class _Handler(BaseHTTPRequestHandler):
         auth  = self.headers.get("Authorization", "")
         token = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
         if not token or not hmac.compare_digest(token.encode(), _admin_token().encode()):
-            set_lockout(admin_key)
             self._send_json(401, {"ok": False, "reason": "unauthorized"})
             return
+        release_attempt(admin_key)
 
-        if not _claim_restart_slot():
-            rem = _restart_cooldown_remaining()
-            self._send_json(429, {"ok": False, "reason": "cooldown",
+        claimed, why = _claim_restart_slot()
+        if not claimed:
+            rem = _restart_cooldown_remaining() if why == "cooldown" else 5
+            self._send_json(429, {"ok": False, "reason": why,
                                    "retryAfterSeconds": int(rem) + 1},
                             extra=[("Retry-After", str(int(rem) + 1))])
             return
-
-        result = _do_restart()
+        try:
+            result = _do_restart()
+        finally:
+            _release_restart_slot()
         self._send_json(200 if result["ok"] else 500, result)
 
     def _serve_live(self) -> None:
@@ -491,14 +664,13 @@ class _Handler(BaseHTTPRequestHandler):
         staleness (missing/old/garbled data -> "stale")."""
         fpath = os.path.join(DATA_DIR, "live.json")
         try:
-            with open(fpath, "rb") as f:
-                live = json.loads(f.read())
+            live = json.loads(_cfgmod.safe_read(fpath))
             if not isinstance(live, dict):
                 raise ValueError
         except FileNotFoundError:
             live = {"status": "stale", "reason": "no data yet"}
             self._send_json(200, live); return
-        except ValueError:
+        except (ValueError, OSError):
             live = {"status": "stale", "reason": "unreadable data"}
             self._send_json(200, live); return
         # Defence in depth: never emit Steam IDs, even from an old live.json.
@@ -514,19 +686,54 @@ class _Handler(BaseHTTPRequestHandler):
     def _serve(self, filename: str, ct: str) -> None:
         fpath = os.path.join(DATA_DIR, filename)
         try:
-            with open(fpath, "rb") as f:
-                data = f.read()
-        except FileNotFoundError:
+            data = _cfgmod.safe_read(fpath)
+        except OSError:      # missing, symlink or not a regular file
             self._send(404, "text/plain", b"Not found"); return
         self._send(200, ct, data)
 
 
+class _BoundedServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a hard cap on simultaneous handler threads;
+    connections over the cap get an immediate 503 instead of a new thread."""
+    daemon_threads = True
+
+    def __init__(self, addr, handler, max_connections: int):
+        self._slots = threading.BoundedSemaphore(max_connections)
+        super().__init__(addr, handler)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.settimeout(1)
+                request.sendall(b"HTTP/1.0 503 Service Unavailable\r\nRetry-After: 5\r\n"
+                                b"Cache-Control: no-store\r\nContent-Length: 0\r\n"
+                                b"Connection: close\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
 if __name__ == "__main__":
-    _pw()            # fail fast if env vars missing
-    if COMPOSE_FILE:
-        _admin_token()
-    # Threaded: a slow /admin/restart request must not block ordinary
+    os.umask(0o027)
+    _password = _pw()            # fail fast if env vars missing
+    _token = _admin_token() if COMPOSE_FILE else None
+    for _w in startup_checks(_password, _token):
+        print(f"[enshrouded-monitor-web] WARNING: {_w}", flush=True)
+    _cookie_secret()
+    # Threaded (bounded): a slow /admin/restart request must not block ordinary
     # /live.json or dashboard traffic for other visitors while it runs.
-    _srv = ThreadingHTTPServer((BIND, PORT), _Handler)   # bind first: fail loudly if port busy
+    _srv = _BoundedServer((BIND, PORT), _Handler, MAX_CONNECTIONS)   # bind first: fail loudly if port busy
     print(f"[enshrouded-monitor-web] listening {BIND}:{PORT}", flush=True)
     _srv.serve_forever()

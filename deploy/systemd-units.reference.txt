@@ -1,6 +1,24 @@
-# Reference systemd units. Adjust /opt/enshrouded-monitor to wherever you copied
-# the contents of src/ (all .py files must live in the same directory).
-# Replace <placeholders>. Keep the env files mode 0600, owned by root.
+# Reference systemd units (hardened). Adjust /opt/enshrouded-monitor to wherever
+# you copied the contents of src/ (all .py files must live in the same directory).
+# Replace <placeholders>. Keep env files mode 0600, owned by root.
+#
+# Accounts and ownership (create once):
+#   sudo groupadd --system enshrouded-monitor
+#   sudo useradd  --system --no-create-home --shell /usr/sbin/nologin \
+#        --gid enshrouded-monitor enshrouded-web          # web server: reads data only
+#   sudo useradd  --system --no-create-home --shell /usr/sbin/nologin \
+#        --gid enshrouded-monitor --groups docker enshrouded-collector   # collector: needs `docker`
+#   Code (/opt/enshrouded-monitor) and config (/etc/enshrouded-monitor): root-owned, not writable
+#   by the service accounts. Data dir /var/lib/enshrouded-monitor: owner enshrouded-collector,
+#   group enshrouded-monitor, mode 2750 (setgid). Files the collector writes are 0640, so the
+#   web account can read but never modify them (and the Steam cache is 0600, collector only).
+#
+# WARNING: membership of the `docker` group (or access to the Docker socket) is
+# equivalent to root on the host. The collector needs it for `docker inspect/stats/logs`;
+# the web server needs it ONLY if /admin/restart is enabled ([admin] compose_file).
+# Keep the unprivileged web unit (no docker access, admin disabled) for the dashboard; if you
+# need remote restart, run it as a SECOND instance (own config, own port, only reachable
+# through a proxy path that you restrict) using the "privileged restart" unit below.
 
 # /etc/systemd/system/enshrouded-monitor.service
 [Unit]
@@ -9,8 +27,25 @@ After=docker.service
 
 [Service]
 Type=oneshot
+User=enshrouded-collector
+Group=enshrouded-monitor
+SupplementaryGroups=docker
+UMask=0027
 Environment=ENSHROUDED_MONITOR_CONFIG=/etc/enshrouded-monitor/config.toml
 ExecStart=/usr/bin/python3 /opt/enshrouded-monitor/enshrouded-monitor.py
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/enshrouded-monitor
+ReadOnlyPaths=/etc/enshrouded-monitor /opt/enshrouded-monitor
 
 # /etc/systemd/system/enshrouded-monitor.timer
 [Unit]
@@ -23,21 +58,55 @@ AccuracySec=10s
 [Install]
 WantedBy=timers.target
 
-# /etc/systemd/system/enshrouded-monitor-web.service
-# /etc/enshrouded-monitor/secrets.env contains (values are yours, never commit):
+# /etc/systemd/system/enshrouded-monitor-web.service   (unprivileged: dashboard only)
+# /etc/enshrouded-monitor/secrets.env (root, 0600) contains (values are yours, never commit):
 #   ENSHROUDED_SHARED_PASSWORD=<choose a password>
-#   ENSHROUDED_ADMIN_TOKEN=<long random token; only needed if [admin] compose_file is set>
+#   ENSHROUDED_COOKIE_SECRET=<optional, >= 32 random chars; keeps sessions across restarts>
+# Leave [admin] compose_file empty in this instance.
 [Unit]
 Description=Enshrouded monitor web server (authenticated)
 After=network.target
 
 [Service]
 Type=simple
+User=enshrouded-web
+Group=enshrouded-monitor
+UMask=0027
 Environment=ENSHROUDED_MONITOR_CONFIG=/etc/enshrouded-monitor/config.toml
 EnvironmentFile=/etc/enshrouded-monitor/secrets.env
 ExecStart=/usr/bin/python3 /opt/enshrouded-monitor/enshrouded-monitor-web.py
 Restart=always
 RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+ReadOnlyPaths=/var/lib/enshrouded-monitor /etc/enshrouded-monitor /opt/enshrouded-monitor
+
+# /etc/systemd/system/enshrouded-monitor-admin.service   (OPTIONAL privileged restart instance)
+# Same as the web unit but with its own config file (separate port; [admin] compose_file AND
+# compose_service set) and ENSHROUDED_ADMIN_TOKEN (must differ from the password) in its env file.
+# This process can control Docker == root on the host: expose it only on loopback, route ONLY
+# POST /admin/restart to it in the proxy, and keep its code/config root-owned. The paths in
+# ReadWritePaths are needed because the restart log is written to data_dir.
+#[Service]
+#User=enshrouded-web
+#SupplementaryGroups=docker
+#Environment=ENSHROUDED_MONITOR_CONFIG=/etc/enshrouded-monitor/admin-config.toml
+#EnvironmentFile=/etc/enshrouded-monitor/admin-secrets.env
+#ExecStart=/usr/bin/python3 /opt/enshrouded-monitor/enshrouded-monitor-web.py
+#(keep the same sandboxing options as above, but replace the data-dir ReadOnlyPaths by
+# ReadWritePaths=/var/lib/enshrouded-monitor, and make sure the compose file's directory is readable)
 
 [Install]
 WantedBy=multi-user.target
