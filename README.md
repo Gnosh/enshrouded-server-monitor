@@ -100,19 +100,33 @@ reverse proxy. What the code does:
   stays valid until it expires or the signing key changes (restart without a fixed secret).
   A cookie issued by another service that signs with the old password-based scheme is not accepted.
 - **Brute force**: every login (and admin) attempt is reserved atomically before the body is read, so
-  concurrent guesses are impossible; a failed attempt locks the client IP for 30 s, and
+  concurrent guesses from one client are impossible. The reservation is owned by a token, lives until
+  the request's absolute deadline (plus a few seconds), and only its owner releases it. A failed attempt
+  starts a 30 s cooldown for the client IP when verification finishes, and
   `login_global_limit_per_minute` caps attempts across all clients. The lockout table is bounded and
   evicts the oldest entry when full (it never stops locking). IPs are canonicalised.
   The proxy must **overwrite** `X-Real-IP` and `trusted_proxy_networks` must list only that proxy.
-- **Slowloris**: each request has a socket read timeout plus a total deadline
-  (`request_timeout_seconds`), and at most `max_connections` handler threads exist; extra
-  connections receive `503`.
-- **CSRF**: login and logout are `POST`-only and reject cross-site requests (`Sec-Fetch-Site`, or
-  `Origin` vs `Host` as a fallback). Make your proxy pass `Host` through unchanged.
+- **Slowloris**: the whole request (request line, headers and body) must arrive within
+  `request_timeout_seconds`. The deadline is enforced inside every socket receive (the timeout is
+  recomputed as min(time left, per-read timeout) before each `recv`), so dribbling bytes cannot extend
+  it. At most `max_connections` handler threads exist; extra connections receive `503`. The
+  deadline covers reading the request only, not a long-running `/admin/restart`. Keep your proxy's
+  timeouts as well.
+- **CSRF**: login and logout are `POST`-only and reject cross-site requests. `Sec-Fetch-Site` decides
+  when the browser sends it. Otherwise an `Origin` header must match scheme, host and effective port of
+  `[web] public_origin` (recommended, e.g. `"https://status.example.com"`). If that is unset, `Origin`
+  must match the `Host` header (host and port), and the scheme must also match `X-Forwarded-Proto`
+  when the request comes from a `trusted_proxy_networks` peer (the header is ignored from anyone
+  else). Non-browser clients that send neither header are accepted; they are covered by the
+  password and rate limits, not by CSRF checks.
 - **Caching**: every response carries `Cache-Control: no-store`.
 - **Files**: collector output is written atomically to exclusive temp files, never through a
-  symlink, with mode 0640 (Steam name cache 0600) and umask 027. Run the collector and web server as
-  different accounts and give the web account read-only access (see the units file).
+  symlink, with mode 0640 (Steam name cache 0600) and umask 027. Appended files (CSV, restart log) are
+  checked with `fstat` on the opened descriptor: they must be regular files, and a mode more permissive
+  than 0640 is tightened with `fchmod` when the running account owns the file. If another account
+  owns it, the write is refused when it is accessible by "other" and a warning is logged when only the
+  group is too permissive. The data directory is tightened to 0750 (setgid kept) the same way. Run the
+  collector, dashboard and admin instance as three different accounts (see the units file).
 - **XSS**: chart data is embedded with script-safe JSON, CSV timestamps and numbers are validated.
   The CSP still allows inline scripts (the dashboard is one generated file); the only remaining
   inline-script input is data written by the collector account, so protect write access to `data_dir`.
@@ -122,11 +136,33 @@ reverse proxy. What the code does:
   **Implication:** the process that runs `docker compose` has Docker access, which is equivalent to
   root on the host. Do not enable it on the instance that serves the dashboard unless you accept
   that; the preferred setup is a separate, loopback-only privileged instance (see the units file)
-  that your proxy exposes for `POST /admin/restart` only. The admin token must differ from the
+  that your proxy exposes for `POST /admin/restart` only, running under its OWN Unix account (not the
+  dashboard's: processes of one account can read each other's memory and environment) and writing
+  its log to its own directory via `[admin] restart_log`. The admin token must differ from the
   password (checked at startup).
 - Use a separate, strong, unique password and token. Supply them only via environment variables.
 - Not covered: TLS, per-user accounts, audit logging, or revoking individual sessions. Do not
   expose the backend port directly; firewall it and bind to `127.0.0.1`.
+
+### Upgrading existing installs (ownership and modes)
+
+Older versions created files with the default mode, and `open()` never changes the mode of a file that
+already exists. After upgrading, check once (paths are examples):
+
+```sh
+sudo chown -R enshrouded-collector:enshrouded-monitor /var/lib/enshrouded-monitor
+sudo chmod 2750 /var/lib/enshrouded-monitor
+sudo find /var/lib/enshrouded-monitor -type f -exec chmod 0640 {} +
+sudo chmod 0600 /var/lib/enshrouded-monitor/steam_names.json 2>/dev/null || true
+# Old restart log in the data dir: move it to the admin account's own directory
+sudo install -d -o enshrouded-admin -g enshrouded-admin -m 0750 /var/lib/enshrouded-monitor-admin
+sudo mv /var/lib/enshrouded-monitor/admin-restart.log /var/lib/enshrouded-monitor-admin/ 2>/dev/null || true
+sudo chown enshrouded-admin:enshrouded-admin /var/lib/enshrouded-monitor-admin/admin-restart.log 2>/dev/null || true
+```
+
+and set `restart_log = "/var/lib/enshrouded-monitor-admin/admin-restart.log"` in the admin instance's
+config. If you keep running everything as one account, nothing breaks: the code tightens modes of
+files that account owns, and just warns for files it cannot fix.
 
 ### Deploying behind HTTPS reverse proxy
 
@@ -168,7 +204,8 @@ server {
 ```
 
 Set `trusted_proxy_networks = ["127.0.0.1/32"]` (the proxy's address as seen by the backend),
-leave `cookie_secure = true`, and redirect port 80 to HTTPS.
+`public_origin = "https://status.example.com"`, leave `cookie_secure = true`, and redirect port 80
+to HTTPS.
 
 ## License
 

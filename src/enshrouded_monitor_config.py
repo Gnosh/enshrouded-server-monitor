@@ -13,7 +13,9 @@ import os
 import re
 import stat
 import tempfile
+import sys
 import tomllib
+from urllib.parse import urlsplit
 
 DEFAULTS = {
     "general": {
@@ -35,6 +37,7 @@ DEFAULTS = {
         "port": 8083,
         "cookie_name": "enshrouded_session",
         "cookie_domain": "",        # empty = host-only cookie (recommended)
+        "public_origin": "",        # e.g. "https://status.example.com"; CSRF Origin check target (optional)
         "cookie_secure": True,      # send the Secure flag; set false ONLY for plain-HTTP dev/LAN
         "cookie_max_age_seconds": 2592000,   # session lifetime (30 days)
         "trusted_proxy_networks": [],  # CIDRs whose X-Real-IP is trusted
@@ -48,6 +51,7 @@ DEFAULTS = {
         "restart_cooldown_seconds": 300,
         "stop_timeout_seconds": 60,
         "post_start_wait_seconds": 15,
+        "restart_log": "",          # absolute path; empty = <data_dir>/admin-restart.log
     },
 }
 
@@ -65,7 +69,7 @@ SCHEMA = {
     },
     "web": {
         "bind": ("str",), "port": ("int", 1, 65535), "cookie_name": ("str",),
-        "cookie_domain": ("str",), "cookie_secure": ("bool",),
+        "cookie_domain": ("str",), "public_origin": ("str",), "cookie_secure": ("bool",),
         "cookie_max_age_seconds": ("int", 60, 31_536_000),
         "trusted_proxy_networks": ("list",),
         "max_connections": ("int", 1, 1024),
@@ -77,6 +81,7 @@ SCHEMA = {
         "restart_cooldown_seconds": ("int", 0, 86_400),
         "stop_timeout_seconds": ("int", 1, 600),
         "post_start_wait_seconds": ("int", 0, 300),
+        "restart_log": ("str",),
     },
 }
 
@@ -105,6 +110,19 @@ def _check_value(section, key, value):
         raise ValueError(f"{name} must be between {spec[1]} and {spec[2]}, got {value!r}")
 
 
+def parse_public_origin(value):
+    """'https://host[:port]' -> (scheme, host, effective_port). ValueError if malformed."""
+    try:
+        u = urlsplit(value)
+        port = u.port
+    except ValueError:
+        raise ValueError(f"web.public_origin is not a valid origin: {value!r}") from None
+    if (u.scheme not in ("http", "https") or not u.hostname or u.path not in ("", "/")
+            or u.query or u.fragment or u.username is not None):
+        raise ValueError("web.public_origin must look like https://host[:port] (no path)")
+    return u.scheme, u.hostname.lower(), port or (443 if u.scheme == "https" else 80)
+
+
 def validate_config(cfg):
     """Raise ValueError on unknown sections/keys, wrong types or bad ranges."""
     for section, values in cfg.items():
@@ -121,6 +139,10 @@ def validate_config(cfg):
         raise ValueError("web.cookie_name must be 1-64 chars of A-Z a-z 0-9 _ -")
     if w["cookie_domain"] and not _DOMAIN_RE.fullmatch(w["cookie_domain"]):
         raise ValueError("web.cookie_domain must be empty or a plain hostname")
+    if w["public_origin"]:
+        parse_public_origin(w["public_origin"])
+    if a["restart_log"] and not os.path.isabs(a["restart_log"]):
+        raise ValueError("admin.restart_log must be empty or an absolute path")
     for n in w["trusted_proxy_networks"]:
         try:
             ipaddress.ip_network(n, strict=False)
@@ -163,11 +185,59 @@ def atomic_write(path, data, mode=0o640):
         raise
 
 
+def _warn(msg):
+    print(f"[enshrouded-monitor] WARNING: {msg}", file=sys.stderr, flush=True)
+
+
+def enforce_fd_mode(fd, path, mode, what="file"):
+    """Make the opened `fd` no more permissive than `mode` (special bits such as
+    setgid are kept). If we own it we tighten it with fchmod. If someone else
+    owns it we cannot: refuse when it is accessible by 'other', else warn."""
+    st = os.fstat(fd)
+    cur = stat.S_IMODE(st.st_mode)
+    extra = cur & 0o777 & ~mode
+    if not extra:
+        return
+    if st.st_uid == os.geteuid():
+        os.fchmod(fd, cur & ~extra)
+        return
+    msg = (f"{what} {path} is owned by uid {st.st_uid} with mode {cur:04o} (wanted at most "
+           f"{mode:04o}) and cannot be tightened by this account; fix with chown/chmod "
+           f"(see README, 'Upgrading existing installs')")
+    if extra & 0o007:
+        raise PermissionError(msg)
+    _warn(msg)
+
+
 def safe_append(path, text, mode=0o640):
-    """Append to `path` without following a symlink at the final component."""
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, mode)
-    with os.fdopen(fd, "a") as f:
-        f.write(text)
+    """Append to `path` without following a symlink at the final component.
+    An existing file must be a regular file; its mode is enforced via fstat/fchmod."""
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, mode)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"not a regular file: {path}")
+        enforce_fd_mode(fd, path, mode)
+        with os.fdopen(fd, "a") as f:
+            fd = -1
+            f.write(text)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def ensure_dir(path, mode=0o750):
+    """Create `path` (and parents) if missing, then enforce its mode through an
+    O_DIRECTORY|O_NOFOLLOW descriptor (see enforce_fd_mode for non-owned dirs;
+    for directories we only warn, never refuse)."""
+    os.makedirs(path, mode=mode, exist_ok=True)
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            enforce_fd_mode(fd, path, mode, what="directory")
+        except PermissionError as e:
+            _warn(str(e))
+    finally:
+        os.close(fd)
 
 
 def safe_read(path):

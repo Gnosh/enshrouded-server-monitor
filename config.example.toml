@@ -29,6 +29,9 @@ port = 8083
 cookie_name = "enshrouded_session"
 cookie_domain = ""                         # empty = host-only cookie (recommended). Set only to share the
                                            # cookie with sibling subdomains, e.g. "status.example.com"
+public_origin = ""                         # optional, e.g. "https://status.example.com": the exact origin (scheme,
+                                           # host, port) browsers use; Origin headers are compared against it for
+                                           # CSRF. Unset = compare Origin to the Host header instead.
 cookie_secure = true                       # Secure flag on the session cookie. Set false ONLY for plain-HTTP
                                            # dev/LAN use (a startup warning is printed)
 cookie_max_age_seconds = 2592000           # session lifetime, 30 days (60..31536000)
@@ -44,4 +47,6 @@ compose_service = ""                       # REQUIRED when compose_file is set, 
                                            # only this service is stopped/started
 restart_cooldown_seconds = 300             # minimum time between restarts (0..86400), measured from the end
 stop_timeout_seconds = 60                  # graceful stop timeout (1..600)
+restart_log = ""                           # absolute path of the restart log; empty = <data_dir>/admin-restart.log.
+                                           # Point it at a directory only the admin account can write.
 post_start_wait_seconds = 15               # wait before checking the container is running/healthy (0..300)

@@ -778,7 +778,7 @@ def last_known(field_idx, cast=int):
 
 def main():
     os.umask(0o027)   # data files are group-readable at most, never world-readable
-    os.makedirs(DATA_DIR, mode=0o750, exist_ok=True)
+    _cfgmod.ensure_dir(DATA_DIR, 0o750)
     row = collect()
     row = list(row)
     # Game stops logging save/water events when no players are online.

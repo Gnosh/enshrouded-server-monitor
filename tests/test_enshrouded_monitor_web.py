@@ -143,6 +143,7 @@ class TestLockout(unittest.TestCase):
     def setUp(self):
         with web._lock:
             web._lockouts.clear()
+            web._active.clear()
 
     def test_clean_slate(self):
         self.assertEqual(web.lockout_remaining("192.0.2.4"), 0.0)
@@ -173,23 +174,61 @@ class TestLockout(unittest.TestCase):
     def test_reserve_is_atomic_under_concurrency(self):
         results = []
         def go():
-            results.append(web.reserve_attempt("192.0.2.50"))
+            results.append(web.begin_attempt("192.0.2.50")[0])
         ts = [threading.Thread(target=go) for _ in range(30)]
         [t.start() for t in ts]; [t.join() for t in ts]
         self.assertEqual(sum(1 for r in results if r == 0.0), 1)
 
     def test_release_clears(self):
-        self.assertEqual(web.reserve_attempt("192.0.2.51"), 0.0)
-        self.assertGreater(web.reserve_attempt("192.0.2.51"), 0)
-        web.release_attempt("192.0.2.51")
-        self.assertEqual(web.reserve_attempt("192.0.2.51"), 0.0)
+        rem, tok = web.begin_attempt("192.0.2.51")
+        self.assertEqual(rem, 0.0)
+        self.assertGreater(web.begin_attempt("192.0.2.51")[0], 0)
+        web.finish_attempt("192.0.2.51", tok, True)
+        self.assertEqual(web.begin_attempt("192.0.2.51")[0], 0.0)
+
+    def test_stale_token_cannot_release_newer_reservation(self):
+        k = "192.0.2.60"
+        _, old = web.begin_attempt(k, hold_secs=30)
+        with web._lock:                       # simulate the old reservation expiring
+            web._active[k] = (old, time.time() - 1)
+        rem, new = web.begin_attempt(k, hold_secs=30)
+        self.assertEqual(rem, 0.0)
+        web.finish_attempt(k, old, True)      # late success of the OLD attempt
+        self.assertGreater(web.begin_attempt(k)[0], 0)   # newer one still holds it
+        web.finish_attempt(k, new, True)
+        self.assertEqual(web.begin_attempt(k)[0], 0.0)
+
+    def test_reservation_outlives_default_lockout_when_held_longer(self):
+        k = "192.0.2.61"
+        _, tok = web.begin_attempt(k, hold_secs=120)
+        with web._lock:
+            self.assertGreater(web._active[k][1] - time.time(), 100)
+            web._prune()
+        self.assertGreater(web.begin_attempt(k)[0], 0)
+        web.finish_attempt(k, tok, True)
+
+    def test_cooldown_starts_when_verification_finishes(self):
+        k = "192.0.2.62"
+        _, tok = web.begin_attempt(k, hold_secs=60)
+        with web._lock:
+            self.assertNotIn(k, web._lockouts)      # no cooldown while in flight
+        time.sleep(0.3)
+        web.finish_attempt(k, tok, False)
+        rem = web.lockout_remaining(k)
+        self.assertGreater(rem, web.LOCKOUT_SECS - 0.2)   # full cooldown from finish
+        self.assertNotIn(k, web._active)
+
+    def test_success_leaves_no_cooldown(self):
+        _, tok = web.begin_attempt("192.0.2.63")
+        web.finish_attempt("192.0.2.63", tok, True)
+        self.assertEqual(web.lockout_remaining("192.0.2.63"), 0.0)
 
     def test_global_limit(self):
         old = web.GLOBAL_LOGIN_PER_MIN
         web.GLOBAL_LOGIN_PER_MIN = 3
         web._global_hits["login"].clear()
         try:
-            got = [web.reserve_attempt(f"192.0.2.{100+i}") for i in range(5)]
+            got = [web.begin_attempt(f"192.0.2.{100+i}")[0] for i in range(5)]
             self.assertEqual([g == 0.0 for g in got], [True, True, True, False, False])
         finally:
             web.GLOBAL_LOGIN_PER_MIN = old
@@ -207,6 +246,7 @@ class TestHTTP(unittest.TestCase):
     def setUp(self):
         with web._lock:
             web._lockouts.clear()
+            web._active.clear()
         web._global_hits["login"].clear()
 
     # No-cookie access

@@ -40,7 +40,7 @@ Admin restart contract:
   otherwise null ("unknown") - a quiet log is not proof that no update ran.
   Response can take ~90s; size any caller timeout accordingly.
 """
-import base64, collections, hashlib, hmac, ipaddress, json, os, secrets, subprocess, sys, threading, time
+import base64, collections, hashlib, hmac, io, ipaddress, json, os, secrets, socket, subprocess, sys, threading, time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse, urlsplit
@@ -56,6 +56,8 @@ DATA_DIR       = _CFG["general"]["data_dir"]
 COOKIE_NAME    = _CFG["web"]["cookie_name"]
 COOKIE_DOMAIN  = _CFG["web"]["cookie_domain"]
 COOKIE_SECURE  = _CFG["web"]["cookie_secure"]
+PUBLIC_ORIGIN  = (_cfgmod.parse_public_origin(_CFG["web"]["public_origin"])
+                  if _CFG["web"]["public_origin"] else None)   # (scheme, host, port)
 COOKIE_MAX_AGE = _CFG["web"]["cookie_max_age_seconds"]
 MAX_CONNECTIONS = _CFG["web"]["max_connections"]
 REQUEST_TIMEOUT_S = float(_CFG["web"]["request_timeout_seconds"])
@@ -68,7 +70,8 @@ STALE_AFTER_S  = float(_CFG["general"]["stale_after_seconds"])
 COMPOSE_FILE        = _CFG["admin"]["compose_file"]
 COMPOSE_SERVICE     = _CFG["admin"]["compose_service"]
 GAME_CONTAINER      = _CFG["general"]["container"]
-RESTART_LOG         = os.path.join(DATA_DIR, "admin-restart.log")
+RESTART_LOG         = (_CFG["admin"]["restart_log"]
+                       or os.path.join(DATA_DIR, "admin-restart.log"))
 RESTART_COOLDOWN_S  = _CFG["admin"]["restart_cooldown_seconds"]
 STOP_TIMEOUT_S      = _CFG["admin"]["stop_timeout_seconds"]
 POST_START_WAIT_S   = _CFG["admin"]["post_start_wait_seconds"]
@@ -197,33 +200,48 @@ def set_lockout(ip: str) -> None:
         _set_locked(ip)
 
 
-def reserve_attempt(key: str, bucket: str = "login") -> float:
-    """Atomically check the per-client lockout AND the global rate, and if both
-    allow it, reserve the attempt (the client is locked for LOCKOUT_SECS until
-    release_attempt() is called after a successful auth). Returns 0.0 when
-    reserved, else the seconds the caller must wait. Because the reservation
-    happens before the body is read and the password compared, concurrent
-    guesses from one client cannot slip through together."""
+_active: dict = {}     # key -> (token, expires_at): attempts currently being verified
+ATTEMPT_MARGIN = 5.0   # seconds of processing allowed after the request deadline
+
+
+def begin_attempt(key: str, bucket: str = "login", hold_secs: float = LOCKOUT_SECS):
+    """Atomically check the per-client cooldown, any attempt of this client that
+    is still in flight, and the global rate; if all allow it, register an active
+    attempt owned by the returned token. Returns (0.0, token) when granted, else
+    (seconds_to_wait, None). `hold_secs` must cover the whole request (callers
+    pass the time left until the request's absolute deadline plus a margin), so
+    a reservation never expires while its request is still being read. The
+    failed-login cooldown starts only when finish_attempt() is called."""
     with _lock:
         _prune()
         now = time.time()
         rem = _lockouts.get(key, 0.0) - now
         if rem > 0:
-            return rem
+            return rem, None
+        act = _active.get(key)
+        if act is not None:
+            return max(1.0, act[1] - now), None
         hits = _global_hits[bucket]
         while hits and hits[0] <= now - 60:
             hits.popleft()
         if len(hits) >= GLOBAL_LOGIN_PER_MIN:
-            return max(1.0, hits[0] + 60 - now)
+            return max(1.0, hits[0] + 60 - now), None
         hits.append(now)
-        _set_locked(key)
-        return 0.0
+        token = object()
+        _active[key] = (token, now + hold_secs)
+        return 0.0, token
 
 
-def release_attempt(key: str) -> None:
-    """Clear the reservation after successful authentication."""
+def finish_attempt(key: str, token, ok: bool) -> None:
+    """End an attempt. Only the reservation matching `token` is released (an
+    older attempt can never clear a newer one). A failed attempt starts the
+    cooldown now, i.e. when verification finished, not when it began."""
     with _lock:
-        _lockouts.pop(key, None)
+        cur = _active.get(key)
+        if cur is not None and cur[0] is token:
+            del _active[key]
+        if not ok:
+            _set_locked(key)
 
 
 def _prune() -> None:
@@ -232,6 +250,9 @@ def _prune() -> None:
     old = [k for k, v in _lockouts.items() if v <= t]
     for k in old:
         del _lockouts[k]
+    old = [k for k, v in _active.items() if v[1] <= t]
+    for k in old:
+        del _active[k]
 
 
 # ── Admin restart ─────────────────────────────────────────────────────────────
@@ -272,8 +293,8 @@ def _log_restart(ts: str, *, ok: bool, update_applied=None, note: str = None) ->
     line = " ".join(parts)
     try:
         _cfgmod.safe_append(RESTART_LOG, line + "\n", mode=0o640)
-    except OSError:
-        pass
+    except OSError as e:
+        print(f"[admin-restart] WARNING: cannot write {RESTART_LOG}: {e}", flush=True)
     print(f"[admin-restart] {line}", flush=True)
 
 
@@ -432,28 +453,31 @@ def _login_html(*, lockout: float = 0.0, wrong: bool = False) -> bytes:
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
-class _DeadlineReader:
-    """Wraps rfile: the whole request (headers + body) must arrive before a
-    fixed deadline, so a client dribbling one byte per socket timeout (slowloris)
-    cannot hold a thread. The socket timeout bounds each individual read."""
+class _DeadlineRaw(io.RawIOBase):
+    """Raw socket reader that enforces an ABSOLUTE deadline on every receive:
+    before each recv the socket timeout is set to min(time left, per-recv
+    timeout), so a client dribbling bytes (slowloris) cannot outlast the
+    deadline no matter how the buffered layer above chunks its reads."""
 
-    def __init__(self, raw, deadline: float):
-        self._raw, self._deadline = raw, deadline
+    def __init__(self, sock, deadline: float, per_recv: float):
+        super().__init__()
+        self._sock, self._deadline, self._per_recv = sock, deadline, per_recv
 
-    def _check(self):
-        if time.monotonic() > self._deadline:
+    def readable(self):
+        return True
+
+    def readinto(self, buf):
+        left = self._deadline - time.monotonic()
+        if left <= 0:
             raise TimeoutError("request deadline exceeded")
-
-    def readline(self, *a):
-        self._check()
-        return self._raw.readline(*a)
-
-    def read(self, *a):
-        self._check()
-        return self._raw.read(*a)
-
-    def __getattr__(self, name):
-        return getattr(self._raw, name)
+        try:
+            self._sock.settimeout(min(left, self._per_recv))
+            return self._sock.recv_into(buf)
+        finally:
+            try:
+                self._sock.settimeout(self._per_recv)   # keep writes on the normal timeout
+            except OSError:
+                pass
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -463,7 +487,15 @@ class _Handler(BaseHTTPRequestHandler):
 
     def setup(self):
         super().setup()
-        self.rfile = _DeadlineReader(self.rfile, time.monotonic() + REQUEST_TIMEOUT_S)
+        self._deadline = time.monotonic() + REQUEST_TIMEOUT_S
+        self.rfile.close()   # drop the plain makefile() reader; ours enforces the deadline
+        self.rfile = io.BufferedReader(
+            _DeadlineRaw(self.connection, self._deadline, float(self.timeout)))
+
+    def _attempt_hold(self) -> float:
+        """How long an auth reservation must live: until this request's
+        absolute deadline, plus a small processing margin."""
+        return max(0.0, self._deadline - time.monotonic()) + ATTEMPT_MARGIN
 
     def log_message(self, fmt, *args):
         pass   # never log paths — could contain form data in edge cases
@@ -491,16 +523,49 @@ class _Handler(BaseHTTPRequestHandler):
             pass
         return peer
 
+    def _peer_trusted(self) -> bool:
+        try:
+            peer = ipaddress.ip_address(canonical_ip(self.client_address[0]))
+            return any(peer in n for n in _TRUSTED_PROXY_NETS)
+        except ValueError:
+            return False
+
     def _same_origin(self) -> bool:
         """CSRF guard for browser-driven state changes. Sec-Fetch-Site (set by
-        the browser, unforgeable by pages) decides when present; else an Origin
-        header must match Host; non-browser clients send neither and pass."""
+        the browser, unforgeable by pages) decides when present. Otherwise an
+        Origin header must match scheme + host + effective port of the
+        configured [web] public_origin; when that is unset it must match the
+        Host header (and the scheme given by X-Forwarded-Proto, honoured only
+        from trusted proxy networks). Non-browser clients send none of these
+        headers and pass."""
         sfs = self.headers.get("Sec-Fetch-Site")
         if sfs is not None:
             return sfs == "same-origin"
         origin = self.headers.get("Origin")
-        if origin is not None:
-            return urlsplit(origin).netloc == self.headers.get("Host", "")
+        if origin is None:
+            return True
+        try:
+            u = urlsplit(origin)
+            o_scheme, o_host = u.scheme, (u.hostname or "").lower()
+            o_port = u.port or {"http": 80, "https": 443}.get(o_scheme)
+        except ValueError:
+            return False
+        if o_scheme not in ("http", "https") or not o_host or o_port is None:
+            return False
+        if PUBLIC_ORIGIN is not None:
+            return (o_scheme, o_host, o_port) == PUBLIC_ORIGIN
+        try:
+            h = urlsplit("//" + self.headers.get("Host", ""))
+            h_host = (h.hostname or "").lower()
+            h_port = h.port if h.port is not None else {"http": 80, "https": 443}[o_scheme]
+        except ValueError:
+            return False
+        if not h_host or (o_host, o_port) != (h_host, h_port):
+            return False
+        if self._peer_trusted():
+            xfp = self.headers.get("X-Forwarded-Proto", "").split(",")[0].strip().lower()
+            if xfp in ("http", "https") and xfp != o_scheme:
+                return False
         return True
 
     def _cookie_value(self):
@@ -601,21 +666,25 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(403, "text/plain", b"Forbidden"); return
         ip  = self._ip()
         # Reserve the attempt BEFORE reading the body or comparing passwords.
-        rem = reserve_attempt(ip, "login")
+        rem, token = begin_attempt(ip, "login", self._attempt_hold())
         if rem > 0:
             self._send_429(rem); return
 
+        ok = False
         try:
-            length = max(0, int(self.headers.get("Content-Length", 0)))
-            raw = self.rfile.read(min(length, 4096)).decode(errors="replace")
-        except (ValueError, OSError):    # bad length, timeout, reset: attempt stays counted
-            self.close_connection = True
-            return
-        attempt = parse_qs(raw).get("password", [""])[0]
-        # attempt is never logged, stored, or passed outside this scope
+            try:
+                length = max(0, int(self.headers.get("Content-Length", 0)))
+                raw = self.rfile.read(min(length, 4096)).decode(errors="replace")
+            except (ValueError, OSError):    # bad length, timeout, reset: counts as a failure
+                self.close_connection = True
+                return
+            attempt = parse_qs(raw).get("password", [""])[0]
+            # attempt is never logged, stored, or passed outside this scope
+            ok = hmac.compare_digest(attempt.encode(), _pw().encode())
+        finally:
+            finish_attempt(ip, token, ok)
 
-        if hmac.compare_digest(attempt.encode(), _pw().encode()):
-            release_attempt(ip)
+        if ok:
             self._redirect("/", extra=[("Set-Cookie", self._cookie_header())])
         else:
             self._send_429(lockout_remaining(ip) or LOCKOUT_SECS)
@@ -632,7 +701,7 @@ class _Handler(BaseHTTPRequestHandler):
         ip        = self._ip()
         admin_key = "admin:" + ip
 
-        rem = reserve_attempt(admin_key, "admin")
+        rem, atoken = begin_attempt(admin_key, "admin", self._attempt_hold())
         if rem > 0:
             self._send_json(429, {"ok": False, "reason": "auth_lockout",
                                    "retryAfterSeconds": int(rem) + 1},
@@ -641,10 +710,14 @@ class _Handler(BaseHTTPRequestHandler):
 
         auth  = self.headers.get("Authorization", "")
         token = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
-        if not token or not hmac.compare_digest(token.encode(), _admin_token().encode()):
+        ok = False
+        try:
+            ok = bool(token) and hmac.compare_digest(token.encode(), _admin_token().encode())
+        finally:
+            finish_attempt(admin_key, atoken, ok)
+        if not ok:
             self._send_json(401, {"ok": False, "reason": "unauthorized"})
             return
-        release_attempt(admin_key)
 
         claimed, why = _claim_restart_slot()
         if not claimed:
