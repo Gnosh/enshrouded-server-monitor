@@ -1,5 +1,7 @@
 # Enshrouded Monitor
 
+![Status page: cores, memory, players, entities, tick time and 24-hour charts](docs/screenshot.png)
+
 A small, dependency-free (Python 3.11+ stdlib only) status monitor for an
 Enshrouded dedicated server running in Docker.
 
